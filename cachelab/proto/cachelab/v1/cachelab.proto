@@ -1,0 +1,306 @@
+syntax = "proto3";
+
+package cachelab.v1;
+
+option go_package = "cachelab/gen/cachelab/v1;cachelabv1";
+
+// ---------------------------------------------------------------------------
+// 公共类型
+// ---------------------------------------------------------------------------
+
+message KeyValue {
+  string key = 1;
+  bytes value = 2;
+}
+
+message HotKey {
+  string key = 1;
+  int64 accesses = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Router:集群控制面 + 路由查询
+// ---------------------------------------------------------------------------
+
+service Router {
+  // 节点管理:先注册(预分配 token),再 Join。未知节点无法加入。
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  // 权重变更:生成新环版本 + 迁移计划,旧环继续服务在途请求。
+  rpc SetWeight(SetWeightRequest) returns (SetWeightResponse);
+  rpc ListRings(ListRingsRequest) returns (ListRingsResponse);
+
+  // 路由查询(读路径)。ring_version=0 表示当前活跃版本;
+  // 显式指定旧版本可为在途请求提供一致视图。
+  rpc Route(RouteRequest) returns (RouteResponse);
+  // 写路径路由:主副本 + 迁移窗口内的镜像写目标。
+  rpc RouteWrite(RouteWriteRequest) returns (RouteWriteResponse);
+
+  // 迁移生命周期:复制与切换分离。
+  rpc StartMigration(StartMigrationRequest) returns (StartMigrationResponse);
+  rpc ResumeMigration(ResumeMigrationRequest) returns (ResumeMigrationResponse);
+  rpc MigrationStatus(MigrationStatusRequest) returns (MigrationStatusResponse);
+  rpc SwitchRing(SwitchRingRequest) returns (SwitchRingResponse);
+  rpc Cleanup(CleanupRequest) returns (CleanupResponse);
+
+  // 观测
+  rpc KeyDistribution(KeyDistributionRequest) returns (KeyDistributionResponse);
+  rpc HotKeys(HotKeysRequest) returns (HotKeysResponse);
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string addr = 2;
+  string token = 3; // 预共享令牌,Join 时校验
+  int32 weight = 4;
+}
+
+message RegisterNodeResponse {}
+
+message JoinRequest {
+  string node_id = 1;
+  string token = 2;
+}
+
+message JoinResponse {
+  int64 active_ring_version = 1;
+  int32 weight = 2;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string addr = 2;
+  int32 weight = 3;
+  string state = 4;
+}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated NodeInfo nodes = 1;
+}
+
+message SetWeightRequest {
+  string node_id = 1;
+  int32 weight = 2; // 0 = 该节点退出哈希环
+}
+
+message SetWeightResponse {
+  int64 new_ring_version = 1;
+  int64 plan_id = 2;
+  int32 range_count = 3;
+}
+
+message RingInfo {
+  int64 version = 1;
+  string state = 2;
+  int32 vnode_count = 3;
+  bool active = 4;
+}
+
+message ListRingsRequest {}
+
+message ListRingsResponse {
+  repeated RingInfo rings = 1;
+}
+
+message RouteRequest {
+  string key = 1;
+  int64 ring_version = 2; // 0 = 活跃版本
+}
+
+message RouteResponse {
+  string node_id = 1;
+  string addr = 2;
+  int64 ring_version = 3;
+}
+
+message WriteTarget {
+  string node_id = 1;
+  string addr = 2;
+  int64 ring_version = 3; // 写入时携带的版本号
+}
+
+message RouteWriteRequest {
+  string key = 1;
+}
+
+message RouteWriteResponse {
+  WriteTarget primary = 1;
+  repeated WriteTarget mirrors = 2; // 迁移窗口内需要双写的目标
+}
+
+message StartMigrationRequest {
+  int64 plan_id = 1;
+  // 教学用故障注入:复制完 N 个区间后模拟崩溃(-1 = 不注入)
+  int32 fail_after_ranges = 2;
+}
+
+message StartMigrationResponse {
+  string state = 1;
+}
+
+message ResumeMigrationRequest {
+  int64 plan_id = 1;
+}
+
+message ResumeMigrationResponse {
+  string state = 1;
+}
+
+message RangeProgress {
+  int32 range_id = 1;
+  string start_hex = 2; // 区间 (start, end],十六进制定宽编码
+  string end_hex = 3;
+  string from_node = 4;
+  string to_node = 5;
+  string state = 6;
+  int64 expected_keys = 7; // 计划时源节点区间内的键数(路由变化量)
+  int64 copied_keys = 8;   // 实际复制键数(实际迁移量)
+}
+
+message MigrationStatusRequest {
+  int64 plan_id = 1;
+}
+
+message MigrationStatusResponse {
+  string state = 1;
+  int64 from_version = 2;
+  int64 to_version = 3;
+  repeated RangeProgress ranges = 4;
+  int64 total_expected_keys = 5;
+  int64 total_copied_keys = 6;
+  double changed_fraction = 7; // 哈希空间易主比例
+}
+
+message SwitchRingRequest {
+  int64 plan_id = 1;
+}
+
+message SwitchRingResponse {
+  int64 active_ring_version = 1;
+}
+
+message CleanupRequest {
+  int64 plan_id = 1;
+}
+
+message CleanupResponse {
+  int64 deleted_keys = 1;
+}
+
+message NodeDistribution {
+  string node_id = 1;
+  double predicted_fraction = 2; // 环上哈希空间占比(预测)
+  int64 actual_keys = 3;         // 节点实际键数
+  int32 vnode_count = 4;
+}
+
+message KeyDistributionRequest {}
+
+message KeyDistributionResponse {
+  int64 ring_version = 1;
+  repeated NodeDistribution nodes = 2;
+}
+
+message NodeHotKeys {
+  string node_id = 1;
+  repeated HotKey hot_keys = 2;
+}
+
+message HotKeysRequest {
+  int32 top_n = 1;
+}
+
+message HotKeysResponse {
+  repeated NodeHotKeys per_node = 1;
+  repeated HotKey global = 2;
+}
+
+// ---------------------------------------------------------------------------
+// KVNode:本地键值节点(数据面 + 受控的迁移接口)
+// ---------------------------------------------------------------------------
+
+service KVNode {
+  // 数据面(客户端直连)
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // 控制面(仅 Router 调用,需 x-node-token 元数据)
+  rpc ExportRange(ExportRangeRequest) returns (stream ExportRangeResponse);
+  rpc ImportBatch(ImportBatchRequest) returns (ImportBatchResponse);
+  rpc DeleteRange(DeleteRangeRequest) returns (DeleteRangeResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  rpc SetActiveVersion(SetActiveVersionRequest) returns (SetActiveVersionResponse);
+}
+
+message GetRequest {
+  string key = 1;
+  int64 ring_version = 2;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  int64 ring_version = 3; // 过旧版本的写会被拒绝,防止切换后写丢失
+}
+
+message PutResponse {}
+
+message DeleteRequest {
+  string key = 1;
+  int64 ring_version = 2;
+}
+
+message DeleteResponse {
+  bool existed = 1;
+}
+
+message ExportRangeRequest {
+  string start_hex = 1; // (start, end],end 可小于 start 表示跨零回绕
+  string end_hex = 2;
+  bool count_only = 3;
+}
+
+message ExportRangeResponse {
+  KeyValue kv = 1;      // count_only=false 时逐条返回
+  int64 count = 2;      // count_only=true 时仅首条返回总数
+}
+
+message ImportBatchRequest {
+  repeated KeyValue items = 1;
+}
+
+message ImportBatchResponse {
+  int64 imported = 1;
+}
+
+message DeleteRangeRequest {
+  string start_hex = 1;
+  string end_hex = 2;
+}
+
+message DeleteRangeResponse {
+  int64 deleted = 1;
+}
+
+message StatsRequest {}
+
+message StatsResponse {
+  int64 key_count = 1;
+  repeated HotKey hot_keys = 2;
+}
+
+message SetActiveVersionRequest {
+  int64 version = 1;
+}
+
+message SetActiveVersionResponse {}
