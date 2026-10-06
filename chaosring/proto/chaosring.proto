@@ -1,0 +1,341 @@
+syntax = "proto3";
+
+package chaosring;
+
+option go_package = "chaosring/internal/pb;pb";
+
+// ===========================================================================
+// KVNode: 本地键值节点 gRPC 接口
+// 每个节点保存本地 KV(含 staging 暂存区), 由路由器远程调用。
+// 节点不是自组网成员: 必须先由管理员注册并拿到节点令牌, 否则一律拒绝。
+// ===========================================================================
+service KVNode {
+  // 常规读写。走 active ring 时访问正式 map; 迁移期间路由仍指向旧主。
+  rpc Put(NodePutRequest) returns (NodePutResponse);
+  rpc Get(NodeGetRequest) returns (NodeGetResponse);
+  rpc Delete(NodeDeleteRequest) returns (NodeDeleteResponse);
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
+
+  // 迁移复制: 写入目标节点的 staging 暂存区(不进入正式 map)。
+  // 幂等: 同一 (migration_id, key) 重复复制结果一致, 可断点续传。
+  rpc StageCopy(StageCopyRequest) returns (StageCopyResponse);
+  // 提交切换: 把本节点承担的 staging 条目一次性提升为正式数据。
+  // 这一步与"复制完成"严格分离: 复制完不算切换, 必须显式 commit。
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+  // 迁移放弃/旧环退役: 清理本节点上暂存或某旧环遗留的本地副本。
+  rpc DropStaging(DropStagingRequest) returns (DropStagingResponse);
+  // 旧环退役后, 显式清除本节点上已迁走键的本地副本(不写墓碑, 纯空间回收)。
+  rpc PurgeKeys(PurgeKeysRequest) returns (PurgeKeysResponse);
+
+  // 故障注入(仅教学演示): 后续所有调用返回 UNAVAILABLE, 模拟节点宕机。
+  rpc Fail(FailRequest) returns (FailResponse);
+  rpc Recover(RecoverRequest) returns (RecoverResponse);
+
+  // 热点统计 / 节点自证身份
+  rpc Stats(StatsRequest) returns (NodeStats);
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+}
+
+message NodePutRequest {
+  string key = 1;
+  bytes value = 2;
+  uint64 version = 3;             // 路由器单调写版本, 用于防止旧值覆盖新值
+  string node_token = 4;          // 节点身份令牌
+}
+message NodePutResponse { uint64 version = 1; }
+
+message NodeGetRequest {
+  string key = 1;
+  string node_token = 2;
+}
+message NodeGetResponse {
+  bool found = 1;
+  bytes value = 2;
+  uint64 version = 3;
+  bool deleted = 4;               // 墓碑键: 迁移时必须连删除一起复制
+}
+
+message NodeDeleteRequest {
+  string key = 1;
+  uint64 version = 2;
+  string node_token = 3;
+}
+message NodeDeleteResponse {}
+
+message ListKeysRequest {
+  string migration_id = 1;        // 为空表示列正式 map; 非空表示列该迁移的 staging
+  string node_token = 2;
+}
+message ListKeysResponse { repeated string keys = 1; }
+
+message StageCopyRequest {
+  string migration_id = 1;
+  string key = 2;
+  bytes value = 3;                // 空值 + deleted=true 表示复制删除(tombstone)
+  bool deleted = 4;
+  uint64 version = 5;
+  string node_token = 6;
+}
+message StageCopyResponse {
+  bool accepted = 1;
+  bool already_present = 2;
+}
+
+message PromoteRequest {
+  string migration_id = 1;
+  repeated string keys = 2;       // 本节点负责提升的键; 空表示全部
+  string node_token = 3;
+  uint64 target_ring = 4;         // 提升后该节点认知的 active 环版本
+}
+message PromoteResponse { int32 promoted = 1; int32 dropped_tombstones = 2; }
+
+message DropStagingRequest {
+  string migration_id = 1;
+  string node_token = 2;
+}
+message DropStagingResponse { int32 dropped = 1; }
+
+message PurgeKeysRequest {
+  repeated string keys = 1;
+  string node_token = 2;
+}
+message PurgeKeysResponse { int32 purged = 1; }
+
+message FailRequest { string admin_token = 1; }
+message FailResponse {}
+message RecoverRequest { string node_token = 1; }
+message RecoverResponse {}
+
+message StatsRequest { string node_token = 1; }
+message KeyHot {
+  string key = 1;
+  uint64 gets = 2;
+  uint64 puts = 3;
+}
+message NodeStats {
+  string node_id = 1;
+  uint64 key_count = 2;
+  uint64 staging_count = 3;
+  uint64 get_count = 4;
+  uint64 put_count = 5;
+  repeated KeyHot top_keys = 6;
+}
+
+message HandshakeRequest {
+  string node_id = 1;
+  string node_token = 2;
+}
+message HandshakeResponse {
+  bool ok = 1;
+  string node_id = 2;
+  uint64 ring_version = 3;
+}
+
+// ===========================================================================
+// Router: 路由 / 集群管理 / 迁移编排
+// ===========================================================================
+service Router {
+  // ---- 数据面: 按 active ring 路由, 迁移期间对在途键双写 ----
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // 在途请求可显式指定它发起时使用的环版本; 旧环在宽限期内仍可解析。
+  rpc Route(RouteRequest) returns (RouteResponse);
+
+  // ---- 集群管理 ----
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc ListNodes(ListNodesRequest) returns (NodeList);
+  // 权重变化(含 weight=0 摘流) -> 构建新环 + 生成迁移计划, 但不自动切换。
+  rpc Rebalance(RebalanceRequest) returns (MigrationInfo);
+
+  // ---- 迁移生命周期: 复制与切换显式分离 ----
+  rpc StartMigration(StartMigrationRequest) returns (MigrationInfo);
+  rpc MigrationProgress(MigrationProgressRequest) returns (MigrationInfo);
+  rpc CommitSwitch(CommitSwitchRequest) returns (MigrationInfo);
+  rpc AbortMigration(AbortMigrationRequest) returns (MigrationInfo);
+  rpc RetryMigration(RetryMigrationRequest) returns (MigrationInfo);
+  rpc RetireOldRing(RetireRingRequest) returns (RetireRingResponse);
+
+  // ---- 教学观测 ----
+  rpc KeyDistribution(DistributionRequest) returns (DistributionResponse);
+  rpc HotStats(HotStatsRequest) returns (HotStatsResponse);
+  // 独立复算两个环之间的路由变化量(对已登记键), 与实际迁移量对照。
+  rpc RingDiff(RingDiffRequest) returns (RingDiffResponse);
+  // 中断恢复: 重启后扫描迁移状态, 回滚未完成复制, 使系统回到确定状态。
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+}
+
+message GetRequest {
+  string key = 1;
+  uint64 ring_hint = 2;           // 在途请求携带的旧环版本, 0=active
+}
+message GetResponse {
+  bytes value = 1;
+  bool found = 2;
+  string node_id = 3;
+  uint64 ring_version = 4;
+  bool deleted = 5;                // 存在墓碑(删除已生效)
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  uint64 ring_hint = 3;
+}
+message PutResponse {
+  string node_id = 1;
+  uint64 version = 2;
+  uint64 ring_version = 3;
+  bool dual_written = 4;          // true=迁移中, 已同步写旧主与目标 staging
+}
+
+message DeleteRequest {
+  string key = 1;
+  uint64 ring_hint = 2;
+}
+message DeleteResponse {
+  string node_id = 1;
+  uint64 version = 2;
+  uint64 ring_version = 3;
+  bool dual_written = 4;
+}
+
+message RouteRequest {
+  string key = 1;
+  uint64 ring_hint = 2;
+}
+message RouteResponse {
+  string node_id = 1;
+  string address = 2;
+  uint64 ring_version = 3;
+  bool retired = 4;               // 旧环已退役则告知客户端改用 active
+}
+
+message RegisterNodeRequest {
+  string admin_token = 1;
+  string node_id = 2;
+  string address = 3;
+  uint32 weight = 4;
+  string enrollment_secret = 5;   // 节点预共享注册秘密, 防止未知节点自行加入
+  string node_token = 6;          // 可选: 带外预置的节点令牌; 留空则由路由器随机颁发
+}
+message RegisterNodeResponse {
+  string node_token = 1;
+  uint64 registered_at_ring = 2;
+}
+
+message ListNodesRequest { string admin_token = 1; }
+message NodeInfo {
+  string node_id = 1;
+  string address = 2;
+  uint32 weight = 3;
+  bool enabled = 4;
+  string token_hint = 5;
+}
+message NodeList { repeated NodeInfo nodes = 1; }
+
+message RebalanceRequest {
+  string admin_token = 1;
+  map<string, uint32> weights = 2; // 全量权重; 权重 0 = 节点保留但不承载新键
+  string reason = 3;
+}
+
+message StartMigrationRequest {
+  string admin_token = 1;
+  string migration_id = 2;
+}
+message CommitSwitchRequest {
+  string admin_token = 1;
+  string migration_id = 2;
+  bool force = 3;                  // 教学用: 允许观察"未同步完强行切换"的后果校验
+}
+message AbortMigrationRequest {
+  string admin_token = 1;
+  string migration_id = 2;
+}
+message RetryMigrationRequest {
+  string admin_token = 1;
+  string migration_id = 2;
+}
+message MigrationProgressRequest {
+  string admin_token = 1;
+  string migration_id = 2;
+}
+
+message MigrationItem {
+  string key = 1;
+  string from_node = 2;
+  string to_node = 3;
+  string state = 4;                // pending|replicating|replicated|failed|promoted
+  uint64 key_hash = 5;
+  string last_error = 6;
+}
+message MigrationInfo {
+  string migration_id = 1;
+  uint64 from_ring = 2;
+  uint64 to_ring = 3;
+  string state = 4;                // planned|replicating|synced|switching|committed|aborted|failed
+  int32 total = 5;
+  int32 pending = 6;
+  int32 replicated = 7;
+  int32 failed = 8;
+  int32 promoted = 9;
+  string created_at = 10;
+  string updated_at = 11;
+  repeated MigrationItem items = 12;
+}
+
+message RetireRingRequest {
+  string admin_token = 1;
+  uint64 ring_version = 2;
+}
+message RetireRingResponse {
+  uint64 retired_ring = 1;
+  int32 keys_dropped_at_old_owners = 2;
+}
+
+message DistributionRequest {
+  string admin_token = 1;
+  uint64 ring_version = 2;        // 0 = active
+  string key_prefix = 3;          // 统计样本前缀
+  uint32 sample_limit = 4;
+}
+message NodeShare {
+  string node_id = 1;
+  int32 vnodes = 2;
+  int32 owned_keys = 3;
+  double share_pct = 4;
+}
+message DistributionResponse {
+  uint64 ring_version = 1;
+  repeated NodeShare shares = 2;
+  int32 total_registered_keys = 3;
+}
+
+message HotStatsRequest { string admin_token = 1; }
+message HotStatsResponse {
+  repeated KeyHot global_top = 1;
+  repeated NodeStats nodes = 2;
+}
+
+message RingDiffRequest {
+  string admin_token = 1;
+  uint64 from_ring = 2;
+  uint64 to_ring = 3;
+  string key_prefix = 4;          // 可选: 只对部分登记键复算
+}
+message RingDiffResponse {
+  uint64 from_ring = 1;
+  uint64 to_ring = 2;
+  int32 changed = 3;              // 路由变化量(逐键)
+  repeated MigrationItem moves = 4;
+}
+
+message ResumeRequest { string admin_token = 1; }
+message ResumeResponse {
+  repeated string recovered_migrations = 1; // 已对账到"复制完成、待显式提交"
+  repeated string failed_migrations = 2;    // 节点仍不可用, 处于 failed, 待重试或放弃
+  repeated string aborted_migrations = 3;
+  string active_ring = 4;
+}
